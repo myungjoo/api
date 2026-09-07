@@ -9,6 +9,9 @@
 
 #include <gtest/gtest.h>
 #include <glib/gstdio.h>
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
 #include <ml-api-inference-pipeline-internal.h>
 #include <ml-api-internal.h>
 #include <ml-api-service-private.h>
@@ -348,6 +351,16 @@ static const gchar *receiver_pipe_json
 #define SINK_CB_HOLD_TIME (300000)
 
 /**
+ * @brief Handshake between the sink callback and the thread tearing the
+ * service down.
+ */
+typedef struct {
+  GMutex lock;
+  GCond cond;
+  gboolean entered;
+} sink_hold_s;
+
+/**
  * @brief Callback holding the streaming thread while the service is destroyed.
  *
  * The 'name' of the event data is the name of the node info owned by the
@@ -358,13 +371,17 @@ static const gchar *receiver_pipe_json
 static void
 _hold_new_data_cb (ml_service_event_e event, ml_information_h event_data, void *user_data)
 {
-  gint *received = (gint *) user_data;
+  sink_hold_s *hold = (sink_hold_s *) user_data;
   char *node_name = NULL;
 
   if (event != ML_SERVICE_EVENT_NEW_DATA)
     return;
 
-  g_atomic_int_inc (received);
+  g_mutex_lock (&hold->lock);
+  hold->entered = TRUE;
+  g_cond_broadcast (&hold->cond);
+  g_mutex_unlock (&hold->lock);
+
   g_usleep (SINK_CB_HOLD_TIME);
 
   EXPECT_EQ (ml_information_get (event_data, "name", (void **) &node_name), ML_ERROR_NONE);
@@ -372,21 +389,22 @@ _hold_new_data_cb (ml_service_event_e event, ml_information_h event_data, void *
 }
 
 /**
- * @brief Bring a receiver service up to the point where its pipeline is
- * playing and the sink callback is firing.
+ * @brief Bring a receiver service up to the point where the sink callback has
+ * entered and is holding the streaming thread.
  */
 static void
-_start_receiver_pipeline (ml_service_h receiver_h, const gchar *path, gint *received)
+_start_receiver_pipeline (ml_service_h receiver_h, const gchar *path, sink_hold_s *hold)
 {
   ml_service_s *mls = (ml_service_s *) receiver_h;
   nns_edge_data_h data_h = NULL;
-  gint loop;
+  gint64 deadline;
+  gboolean entered;
   int status;
 
   status = _ml_service_training_offloading_set_path (mls, path);
   ASSERT_EQ (status, ML_ERROR_NONE);
 
-  status = ml_service_set_event_cb (receiver_h, _hold_new_data_cb, received);
+  status = ml_service_set_event_cb (receiver_h, _hold_new_data_cb, hold);
   ASSERT_EQ (status, ML_ERROR_NONE);
 
   ASSERT_EQ (nns_edge_data_create (&data_h), NNS_EDGE_ERROR_NONE);
@@ -398,10 +416,17 @@ _start_receiver_pipeline (ml_service_h receiver_h, const gchar *path, gint *rece
   status = _ml_service_training_offloading_start (mls);
   ASSERT_EQ (status, ML_ERROR_NONE);
 
-  for (loop = 0; loop < 500 && g_atomic_int_get (received) == 0; loop++)
-    g_usleep (10000);
+  deadline = g_get_monotonic_time () + 10 * G_TIME_SPAN_SECOND;
 
-  ASSERT_GT (g_atomic_int_get (received), 0);
+  g_mutex_lock (&hold->lock);
+  while (!hold->entered) {
+    if (!g_cond_wait_until (&hold->cond, &hold->lock, deadline))
+      break;
+  }
+  entered = hold->entered;
+  g_mutex_unlock (&hold->lock);
+
+  ASSERT_TRUE (entered);
 }
 
 /**
@@ -411,7 +436,7 @@ _start_receiver_pipeline (ml_service_h receiver_h, const gchar *path, gint *rece
 TEST_F (MLServiceTrainingOffloading, destroyWhileRunning_p)
 {
   int status;
-  gint received = 0;
+  sink_hold_s hold = {};
   ml_service_h receiver_h = NULL;
   g_autofree gchar *path = g_dir_make_tmp ("ml-training-offloading-XXXXXX", NULL);
 
@@ -421,14 +446,36 @@ TEST_F (MLServiceTrainingOffloading, destroyWhileRunning_p)
   g_autofree gchar *receiver_config
       = prepare_test_config ("training_offloading_receiver.conf", avail_port);
 
+  g_mutex_init (&hold.lock);
+  g_cond_init (&hold.cond);
+
   status = ml_service_new (receiver_config, &receiver_h);
   ASSERT_EQ (status, ML_ERROR_NONE);
 
-  _start_receiver_pipeline (receiver_h, path, &received);
+  _start_receiver_pipeline (receiver_h, path, &hold);
+
+#ifdef __GLIBC__
+  /**
+   * Scrub memory as it is released, so that a node name read after the node
+   * table is gone is caught rather than read back intact. glibc skips this for
+   * a chunk that fits the tcache, which the node name normally does; there the
+   * detection instead comes from tcache_put() writing its own link fields over
+   * the first 16 bytes of the chunk. Neither is a property of the code under
+   * test, so a sanitizer build remains the only airtight net for this.
+   */
+  mallopt (M_PERTURB, 0xAA);
+#endif
 
   /* Destroy without stopping first. */
   status = ml_service_destroy (receiver_h);
   EXPECT_EQ (ML_ERROR_NONE, status);
+
+#ifdef __GLIBC__
+  mallopt (M_PERTURB, 0);
+#endif
+
+  g_mutex_clear (&hold.lock);
+  g_cond_clear (&hold.cond);
 
   EXPECT_EQ (g_remove (receiver_config), 0);
   EXPECT_EQ (g_rmdir (path), 0);
@@ -440,7 +487,7 @@ TEST_F (MLServiceTrainingOffloading, destroyWhileRunning_p)
 TEST_F (MLServiceTrainingOffloading, destroyAfterStop_p)
 {
   int status;
-  gint received = 0;
+  sink_hold_s hold = {};
   ml_service_h receiver_h = NULL;
   g_autofree gchar *path = g_dir_make_tmp ("ml-training-offloading-XXXXXX", NULL);
 
@@ -450,16 +497,22 @@ TEST_F (MLServiceTrainingOffloading, destroyAfterStop_p)
   g_autofree gchar *receiver_config
       = prepare_test_config ("training_offloading_receiver.conf", avail_port);
 
+  g_mutex_init (&hold.lock);
+  g_cond_init (&hold.cond);
+
   status = ml_service_new (receiver_config, &receiver_h);
   ASSERT_EQ (status, ML_ERROR_NONE);
 
-  _start_receiver_pipeline (receiver_h, path, &received);
+  _start_receiver_pipeline (receiver_h, path, &hold);
 
   status = ml_service_stop (receiver_h);
   EXPECT_EQ (ML_ERROR_NONE, status);
 
   status = ml_service_destroy (receiver_h);
   EXPECT_EQ (ML_ERROR_NONE, status);
+
+  g_mutex_clear (&hold.lock);
+  g_cond_clear (&hold.cond);
 
   EXPECT_EQ (g_remove (receiver_config), 0);
   EXPECT_EQ (g_rmdir (path), 0);
@@ -512,7 +565,7 @@ TEST_F (MLServiceTrainingOffloading, destroyInvalidParam2_n)
   status = _ml_service_training_offloading_destroy (mls);
   EXPECT_EQ (ML_ERROR_INVALID_PARAMETER, status);
 
-  status = _ml_service_offloading_release_internal (mls);
+  status = _ml_service_destroy_internal (mls);
   EXPECT_EQ (ML_ERROR_NONE, status);
 
   EXPECT_EQ (g_remove (receiver_config), 0);
