@@ -8,10 +8,12 @@
  */
 
 #include <gtest/gtest.h>
+#include <glib/gstdio.h>
 #include <ml-api-inference-pipeline-internal.h>
 #include <ml-api-internal.h>
 #include <ml-api-service-private.h>
 #include <ml-api-service.h>
+#include <nnstreamer-edge.h>
 
 #include "ml-api-service-offloading.h"
 #include "ml-api-service-training-offloading.h"
@@ -333,6 +335,137 @@ TEST_F (MLServiceTrainingOffloading, create_p)
 }
 
 /**
+ * @brief Pipeline the receiver would normally get from the remote sender.
+ * It is self-contained on purpose: the teardown order, not the training
+ * framework, is under test here.
+ */
+static const gchar *receiver_pipe_json
+    = R"JSON({"pipeline":{"description":"videotestsrc is-live=true ! videoconvert ! video/x-raw,format=RGB,width=16,height=16,framerate=30/1 ! tensor_converter ! tensor_sink name=training_result async=false","output_node":[{"name":"training_result"}]}})JSON";
+
+/**
+ * @brief Time the sink callback stays in the pipeline, in microseconds.
+ */
+#define SINK_CB_HOLD_TIME (300000)
+
+/**
+ * @brief Callback holding the streaming thread while the service is destroyed.
+ *
+ * The 'name' of the event data is the name of the node info owned by the
+ * training offloading handle, handed over without a copy. Holding the callback
+ * makes the teardown overlap with it, so reading the name afterwards fails if
+ * the node info was released while the pipeline was still running.
+ */
+static void
+_hold_new_data_cb (ml_service_event_e event, ml_information_h event_data, void *user_data)
+{
+  gint *received = (gint *) user_data;
+  char *node_name = NULL;
+
+  if (event != ML_SERVICE_EVENT_NEW_DATA)
+    return;
+
+  g_atomic_int_inc (received);
+  g_usleep (SINK_CB_HOLD_TIME);
+
+  EXPECT_EQ (ml_information_get (event_data, "name", (void **) &node_name), ML_ERROR_NONE);
+  EXPECT_STREQ (node_name, "training_result");
+}
+
+/**
+ * @brief Bring a receiver service up to the point where its pipeline is
+ * playing and the sink callback is firing.
+ */
+static void
+_start_receiver_pipeline (ml_service_h receiver_h, const gchar *path, gint *received)
+{
+  ml_service_s *mls = (ml_service_s *) receiver_h;
+  nns_edge_data_h data_h = NULL;
+  gint loop;
+  int status;
+
+  status = _ml_service_training_offloading_set_path (mls, path);
+  ASSERT_EQ (status, ML_ERROR_NONE);
+
+  status = ml_service_set_event_cb (receiver_h, _hold_new_data_cb, received);
+  ASSERT_EQ (status, ML_ERROR_NONE);
+
+  ASSERT_EQ (nns_edge_data_create (&data_h), NNS_EDGE_ERROR_NONE);
+  status = _ml_service_training_offloading_process_received_data (mls, data_h,
+      path, receiver_pipe_json, ML_SERVICE_OFFLOADING_TYPE_PIPELINE_RAW);
+  nns_edge_data_destroy (data_h);
+  ASSERT_EQ (status, ML_ERROR_NONE);
+
+  status = _ml_service_training_offloading_start (mls);
+  ASSERT_EQ (status, ML_ERROR_NONE);
+
+  for (loop = 0; loop < 500 && g_atomic_int_get (received) == 0; loop++)
+    g_usleep (10000);
+
+  ASSERT_GT (g_atomic_int_get (received), 0);
+}
+
+/**
+ * @brief Destroying a running service must not release the node info the sink
+ * callback is still using.
+ */
+TEST_F (MLServiceTrainingOffloading, destroyWhileRunning_p)
+{
+  int status;
+  gint received = 0;
+  ml_service_h receiver_h = NULL;
+  g_autofree gchar *path = g_dir_make_tmp ("ml-training-offloading-XXXXXX", NULL);
+
+  ASSERT_NE (nullptr, path);
+
+  guint avail_port = get_available_port ();
+  g_autofree gchar *receiver_config
+      = prepare_test_config ("training_offloading_receiver.conf", avail_port);
+
+  status = ml_service_new (receiver_config, &receiver_h);
+  ASSERT_EQ (status, ML_ERROR_NONE);
+
+  _start_receiver_pipeline (receiver_h, path, &received);
+
+  /* Destroy without stopping first. */
+  status = ml_service_destroy (receiver_h);
+  EXPECT_EQ (ML_ERROR_NONE, status);
+
+  EXPECT_EQ (g_remove (receiver_config), 0);
+  EXPECT_EQ (g_rmdir (path), 0);
+}
+
+/**
+ * @brief Stopping the service before destroying it keeps working.
+ */
+TEST_F (MLServiceTrainingOffloading, destroyAfterStop_p)
+{
+  int status;
+  gint received = 0;
+  ml_service_h receiver_h = NULL;
+  g_autofree gchar *path = g_dir_make_tmp ("ml-training-offloading-XXXXXX", NULL);
+
+  ASSERT_NE (nullptr, path);
+
+  guint avail_port = get_available_port ();
+  g_autofree gchar *receiver_config
+      = prepare_test_config ("training_offloading_receiver.conf", avail_port);
+
+  status = ml_service_new (receiver_config, &receiver_h);
+  ASSERT_EQ (status, ML_ERROR_NONE);
+
+  _start_receiver_pipeline (receiver_h, path, &received);
+
+  status = ml_service_stop (receiver_h);
+  EXPECT_EQ (ML_ERROR_NONE, status);
+
+  status = ml_service_destroy (receiver_h);
+  EXPECT_EQ (ML_ERROR_NONE, status);
+
+  EXPECT_EQ (g_remove (receiver_config), 0);
+  EXPECT_EQ (g_rmdir (path), 0);
+}
+
+/**
  * @brief Test _ml_service_training_offloading_destroy.
  */
 TEST_F (MLServiceTrainingOffloading, destroyInvalidParam1_n)
@@ -341,6 +474,48 @@ TEST_F (MLServiceTrainingOffloading, destroyInvalidParam1_n)
 
   status = _ml_service_training_offloading_destroy (NULL);
   EXPECT_EQ (ML_ERROR_INVALID_PARAMETER, status);
+}
+
+/**
+ * @brief Test _ml_service_training_offloading_destroy with a service that is
+ * not in training mode.
+ */
+TEST_F (MLServiceTrainingOffloading, destroyInvalidParam2_n)
+{
+  int status;
+  ml_service_s *mls;
+
+  g_autoptr (JsonParser) parser = NULL;
+  g_autofree gchar *json_string = NULL;
+  JsonNode *root;
+  JsonObject *object;
+
+  guint avail_port = get_available_port ();
+  g_autofree gchar *receiver_config
+      = prepare_test_config ("service_offloading_receiver.conf", avail_port);
+
+  ASSERT_TRUE (g_file_get_contents (receiver_config, &json_string, NULL, NULL));
+  parser = json_parser_new ();
+  ASSERT_TRUE (json_parser_load_from_data (parser, json_string, -1, NULL));
+  root = json_parser_get_root (parser);
+  ASSERT_NE (nullptr, root);
+  object = json_node_get_object (root);
+  ASSERT_NE (nullptr, object);
+
+  mls = _ml_service_create_internal (ML_SERVICE_TYPE_OFFLOADING);
+  ASSERT_NE (nullptr, mls);
+
+  /* The configuration has no 'training' member, so the mode stays NONE. */
+  status = _ml_service_offloading_create (mls, object);
+  EXPECT_EQ (ML_ERROR_NONE, status);
+
+  status = _ml_service_training_offloading_destroy (mls);
+  EXPECT_EQ (ML_ERROR_INVALID_PARAMETER, status);
+
+  status = _ml_service_offloading_release_internal (mls);
+  EXPECT_EQ (ML_ERROR_NONE, status);
+
+  EXPECT_EQ (g_remove (receiver_config), 0);
 }
 
 /**
