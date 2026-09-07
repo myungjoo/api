@@ -913,7 +913,9 @@ _ml_service_training_offloading_destroy (ml_service_s * mls)
 
   /* Stop the pipeline before releasing the node info the sink callback uses. */
   if (training_s->pipeline_h) {
-    ml_pipeline_stop (training_s->pipeline_h);
+    if (ml_pipeline_stop (training_s->pipeline_h) != ML_ERROR_NONE) {
+      _ml_error_report ("Failed to stop ml pipeline, destroy it anyway.");
+    }
 
     ret = ml_pipeline_destroy (training_s->pipeline_h);
     if (ret != ML_ERROR_NONE) {
