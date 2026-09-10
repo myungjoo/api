@@ -7355,8 +7355,7 @@ test_custom_easy_out_cb (const ml_tensors_data_h in, ml_tensors_data_h out, void
 
   /* the number of the output tensors is fixed to the registered info. */
   if (ml_tensors_data_get_info (out, &out_info) != ML_ERROR_NONE
-      || ml_tensors_info_get_count (out_info, &count) != ML_ERROR_NONE
-      || count != 1U)
+      || ml_tensors_info_get_count (out_info, &count) != ML_ERROR_NONE || count != 1U)
     result->failed = TRUE;
   ml_tensors_info_destroy (out_info);
 
@@ -7377,8 +7376,8 @@ test_custom_easy_out_cb (const ml_tensors_data_h in, ml_tensors_data_h out, void
  * @brief Sink callback to check the output filled by a custom-easy filter.
  */
 static void
-test_custom_easy_out_sink_cb (const ml_tensors_data_h data,
-    const ml_tensors_info_h info, void *user_data)
+test_custom_easy_out_sink_cb (
+    const ml_tensors_data_h data, const ml_tensors_info_h info, void *user_data)
 {
   custom_easy_out_data_s *result = (custom_easy_out_data_s *) user_data;
   void *raw_data = NULL;

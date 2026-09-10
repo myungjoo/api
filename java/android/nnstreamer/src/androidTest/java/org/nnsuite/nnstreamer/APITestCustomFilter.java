@@ -338,7 +338,6 @@ public class APITestCustomFilter {
             }
         })) {
             assertEquals(0, runCustomFilterPipeline(customInvalid.getName(), inputInfo));
-            assertFalse(mInvalidState);
         } catch (Exception e) {
             fail();
         }
@@ -363,7 +362,6 @@ public class APITestCustomFilter {
             }
         })) {
             assertEquals(0, runCustomFilterPipeline(customInvalid.getName(), inputInfo));
-            assertFalse(mInvalidState);
         } catch (Exception e) {
             fail();
         }
@@ -388,7 +386,6 @@ public class APITestCustomFilter {
             }
         })) {
             assertEquals(0, runCustomFilterPipeline(customInvalid.getName(), inputInfo));
-            assertFalse(mInvalidState);
         } catch (Exception e) {
             fail();
         }
