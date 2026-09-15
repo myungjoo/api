@@ -29,7 +29,7 @@ jobs:
         sudo add-apt-repository -y ppa:nnstreamer/ppa
         sudo apt-get update
         sudo apt-get install -y meson ninja-build \
-          libglib2.0-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+          libglib2.0-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libunwind-dev \
           gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
           nnstreamer nnstreamer-dev nnstreamer-dev-internal nnstreamer-single-dev \
           openjdk-17-jdk-headless junit4
