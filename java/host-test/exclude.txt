@@ -8,6 +8,9 @@ org.nnsuite.nnstreamer.APITestCommon#testInitWithInvalidCtx_n
 org.nnsuite.nnstreamer.APITestPipeline#testAvailableElement
 org.nnsuite.nnstreamer.APITestPipeline#testAMCsrc
 
+# The video sink renders to an Android native window; glimagesink needs a display.
+org.nnsuite.nnstreamer.APITestPipeline#testSetNullSurface
+
 # Test assets (image, model) are copied from the Android test package.
 org.nnsuite.nnstreamer.APITestPipeline#testAppsrcPng
 org.nnsuite.nnstreamer.APITestSingleShot#testOptionsUnknownFW_n
