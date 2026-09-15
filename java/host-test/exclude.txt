@@ -1,0 +1,14 @@
+# Instrumented tests that cannot run on the host, one per line: Class#method or Class.
+# An entry that does not match any test fails the run, remove it with the test.
+
+# Android application context is not checked on the host (@BUILD_ANDROID@).
+org.nnsuite.nnstreamer.APITestCommon#testInitWithInvalidCtx_n
+
+# amcsrc is an Android element.
+org.nnsuite.nnstreamer.APITestPipeline#testAvailableElement
+org.nnsuite.nnstreamer.APITestPipeline#testAMCsrc
+
+# Test assets (image, model) are copied from the Android test package.
+org.nnsuite.nnstreamer.APITestPipeline#testAppsrcPng
+org.nnsuite.nnstreamer.APITestSingleShot#testOptionsUnknownFW_n
+org.nnsuite.nnstreamer.APITestSingleShot#testOptionsInvalidFW_n
